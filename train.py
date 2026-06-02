@@ -1,11 +1,13 @@
 import argparse
 import json
 import random
+import time
 from collections import deque
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import (
@@ -32,6 +34,8 @@ def parse_args():
     parser.add_argument("--val_interval", type=int, default=200)
     parser.add_argument("--val_batches", type=int, default=20)
     parser.add_argument("--best_metric", default="val_loss", choices=["val_loss"])
+    parser.add_argument("--log_file", default=None)
+    parser.add_argument("--tensorboard_dir", default=None)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--feature_dim", type=int, default=512)
     parser.add_argument("--hidden_channels", type=int, default=64)
@@ -67,6 +71,23 @@ def save_checkpoint(path: Path, step: int, diffusion: GaussianDiffusion, optimiz
     )
 
 
+class RunLogger:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.file = path.open("a", encoding="utf-8")
+
+    def write(self, message: str):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        print(line)
+        self.file.write(line + "\n")
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
 @torch.no_grad()
 def validate(diffusion: GaussianDiffusion, val_loader: DataLoader, device: torch.device, max_batches: int) -> float:
     diffusion.eval()
@@ -98,6 +119,10 @@ def main():
     data_root = Path(args.data_root)
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(args.log_file) if args.log_file else run_dir / "train.log"
+    tb_dir = Path(args.tensorboard_dir) if args.tensorboard_dir else run_dir / "tensorboard"
+    logger = RunLogger(log_path)
+    writer = SummaryWriter(log_dir=str(tb_dir))
 
     ids = discover_ids(data_root)
     splits = make_splits(ids, seed=args.seed)
@@ -140,11 +165,16 @@ def main():
     diffusion = GaussianDiffusion(model, timesteps=args.timesteps).to(device)
     optimizer = torch.optim.Adam(diffusion.parameters(), lr=args.lr)
 
-    print(
+    logger.write(
         f"device={device} train_items={len(train_set)} val_items={len(val_set)} "
         f"text_model={args.text_model_name} max_steps={args.max_steps}"
     )
-    print(f"run_dir={run_dir}")
+    logger.write(f"run_dir={run_dir}")
+    logger.write(f"tensorboard_dir={tb_dir}")
+    logger.write(f"args={json.dumps(vars(args), sort_keys=True)}")
+    writer.add_text("run/args", json.dumps(vars(args), indent=2, sort_keys=True), global_step=0)
+    writer.add_scalar("run/train_items", len(train_set), 0)
+    writer.add_scalar("run/val_items", len(val_set), 0)
 
     step = 0
     best_val_loss = None
@@ -169,19 +199,25 @@ def main():
             if step % args.log_interval == 0 or step == 1:
                 train_avg = sum(recent_losses) / len(recent_losses)
                 progress.set_postfix(loss=f"{loss.item():.4f}", train_avg=f"{train_avg:.4f}")
-                print(f"step={step} loss={loss.item():.6f} train_loss_avg={train_avg:.6f}")
+                logger.write(f"step={step} loss={loss.item():.6f} train_loss_avg={train_avg:.6f}")
+                writer.add_scalar("loss/train_step", loss.item(), step)
+                writer.add_scalar("loss/train_avg_100", train_avg, step)
+                writer.add_scalar("optim/lr", optimizer.param_groups[0]["lr"], step)
 
             if step % args.val_interval == 0 or step == args.max_steps:
                 val_loss = validate(diffusion, val_loader, device, args.val_batches)
                 train_avg = sum(recent_losses) / len(recent_losses)
-                print(
+                logger.write(
                     f"step={step} train_loss_avg={train_avg:.6f} "
                     f"val_loss={val_loss:.6f} val_batches={args.val_batches}"
                 )
+                writer.add_scalar("loss/val", val_loss, step)
+                writer.add_scalar("loss/train_avg_at_val", train_avg, step)
                 if best_val_loss is None or val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_checkpoint(run_dir / "best.pt", step, diffusion, optimizer, tokenizer, args, best_val_loss)
-                    print(f"saved best checkpoint: {run_dir / 'best.pt'} val_loss={best_val_loss:.6f}")
+                    logger.write(f"saved best checkpoint: {run_dir / 'best.pt'} val_loss={best_val_loss:.6f}")
+                    writer.add_scalar("loss/best_val", best_val_loss, step)
 
             if step % args.save_interval == 0 or step == args.max_steps:
                 save_checkpoint(run_dir / "last.pt", step, diffusion, optimizer, tokenizer, args, best_val_loss)
@@ -191,7 +227,10 @@ def main():
 
     progress.close()
     save_checkpoint(run_dir / "last.pt", step, diffusion, optimizer, tokenizer, args, best_val_loss)
-    print(f"saved checkpoint: {run_dir / 'last.pt'}")
+    logger.write(f"saved checkpoint: {run_dir / 'last.pt'}")
+    writer.flush()
+    writer.close()
+    logger.close()
 
 
 if __name__ == "__main__":

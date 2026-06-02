@@ -22,6 +22,19 @@ If CUDA memory is insufficient, reduce `--batch_size` or `--hidden_channels`.
 
 `last.pt` is always updated during training. `best.pt` is saved when validation loss improves.
 
+Training also writes:
+
+- TensorBoard events: `code/TAS_repro/runs/tas_smoke/tensorboard`
+- Text log: `code/TAS_repro/runs/tas_smoke/train.log`
+
+To view curves:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" -m tensorboard --logdir code\TAS_repro\runs\tas_smoke\tensorboard --port 6006
+```
+
+Then open `http://localhost:6006`.
+
 ## One-second inference
 
 ```powershell
