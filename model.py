@@ -175,6 +175,9 @@ class GaussianDiffusion(nn.Module):
         betas = torch.linspace(beta_start, beta_end, timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
 
@@ -190,3 +193,30 @@ class GaussianDiffusion(nn.Module):
         noisy_diff = self.q_sample(diff, timesteps, noise)
         pred_noise = self.model(noisy_diff, mono, tokens, timesteps)
         return F.mse_loss(pred_noise, noise)
+
+    @torch.no_grad()
+    def sample(self, mono: torch.Tensor, tokens, sample_steps: int = 50) -> torch.Tensor:
+        self.model.eval()
+        x = torch.randn_like(mono)
+        steps = torch.linspace(self.timesteps - 1, 0, sample_steps, device=mono.device).long()
+        steps = torch.unique_consecutive(steps)
+        for i, timestep in enumerate(steps):
+            t = timestep.repeat(mono.shape[0])
+            pred_noise = self.model(x, mono, tokens, t)
+            alpha_t = self.alphas_cumprod[timestep].view(1, 1, 1)
+            pred_x0 = (x - torch.sqrt(1.0 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp_min(1e-8)
+            pred_x0 = pred_x0.clamp(-1.0, 1.0)
+
+            if i == len(steps) - 1:
+                x = pred_x0
+            else:
+                prev_timestep = steps[i + 1]
+                alpha_prev = self.alphas_cumprod[prev_timestep].view(1, 1, 1)
+                x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1.0 - alpha_prev) * pred_noise
+        return x.clamp(-1.0, 1.0)
+
+
+def binaural_from_mono_diff(mono: torch.Tensor, diff: torch.Tensor) -> torch.Tensor:
+    left = (mono + diff) / 2.0
+    right = (mono - diff) / 2.0
+    return torch.cat([left, right], dim=1).clamp(-1.0, 1.0)
