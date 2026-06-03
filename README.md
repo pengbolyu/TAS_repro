@@ -73,3 +73,13 @@ Useful cues:
 - `diff_rms`: left-right difference strength.
 - `lr_corr`: left/right waveform correlation; values near 1.0 are close to mono.
 - `side/mid`: side energy relative to mid energy.
+
+## Batch prompt-direction evaluation
+
+Generate left/center/right prompts for multiple TASBench items and summarize whether ILD follows the expected order:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\batch_eval_prompts.py --checkpoint code\TAS_repro\runs\paper_formula\best.pt --data_root data\TASBench --split val --num_items 20 --mode clip --sample_steps 20 --sampler ddim --out_dir code\TAS_repro\runs\prompt_eval
+```
+
+For listening-ready full-audio evaluation, add `--mode full --hop_sec 0.25 --save_audio`, but it will be much slower and writes three wav files per item.
