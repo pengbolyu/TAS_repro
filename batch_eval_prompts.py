@@ -40,6 +40,11 @@ def extract_first_object(prompt: str):
     return object_phrase, verb
 
 
+def is_single_source_prompt(prompt: str):
+    matches = re.findall(r"\b(?:is|are)\s+(?:on|in)\s+the\s+(?:left|right|center)\b", prompt)
+    return len(matches) == 1
+
+
 def prompts_for_audio(data_root: Path, audio_id: str, prompt_template: str):
     if prompt_template == "generic":
         return PROMPTS, "sound source", "The sound source is on the left."
@@ -63,6 +68,7 @@ def parse_args():
     parser.add_argument("--sample_steps", type=int, default=20)
     parser.add_argument("--sampler", choices=["ddim", "ddpm"], default="ddim")
     parser.add_argument("--prompt_template", choices=["object", "generic"], default="object")
+    parser.add_argument("--single_source_only", action="store_true")
     parser.add_argument("--clip_denoised", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow_model_download", action="store_true")
@@ -124,6 +130,18 @@ def main():
     ids = discover_ids(Path(args.data_root))
     split_ids = make_splits(ids, seed=args.seed)[args.split]
     selected_ids = list(split_ids)
+    skipped_multi_source = 0
+    if args.single_source_only:
+        filtered_ids = []
+        for audio_id in selected_ids:
+            prompts = load_prompts(Path(args.data_root) / "text_prompts" / f"{audio_id}.csv")
+            if is_single_source_prompt(prompts[0]):
+                filtered_ids.append(audio_id)
+            else:
+                skipped_multi_source += 1
+        selected_ids = filtered_ids
+        if not selected_ids:
+            raise RuntimeError(f"No single-source items found in split {args.split}.")
     rng.shuffle(selected_ids)
     selected_ids = selected_ids[: args.num_items]
 
@@ -186,6 +204,7 @@ def main():
                     "prompt_template": args.prompt_template,
                     "object_phrase": object_phrase,
                     "base_prompt": base_prompt,
+                    "is_single_source": is_single_source_prompt(base_prompt),
                 }
             )
             rows.append(row)
@@ -222,6 +241,7 @@ def main():
         "prompt_template",
         "object_phrase",
         "base_prompt",
+        "is_single_source",
         "duration_sec",
         "ild_db",
         "diff_rms",
@@ -244,6 +264,8 @@ def main():
         "sampler": args.sampler,
         "sample_steps": args.sample_steps,
         "prompt_template": args.prompt_template,
+        "single_source_only": args.single_source_only,
+        "skipped_multi_source": skipped_multi_source,
         "order_accuracy_left_gt_center_gt_right": correct_order / max(len(selected_ids), 1),
         "left_vs_right_accuracy": left_right_correct / max(len(selected_ids), 1),
         "center_between_accuracy": center_between / max(len(selected_ids), 1),
