@@ -177,8 +177,10 @@ class TASBenchDataset(Dataset):
 
         clip = waveform[:, start : start + self.sample_length].contiguous()
         left, right = clip[0:1], clip[1:2]
-        mono = (left + right).clamp(-1.0, 1.0)
-        diff = (left - right).clamp(-1.0, 1.0)
+        # Follow the paper formulation exactly: Am = Al + Ar, Ad = Al - Ar.
+        # These signals may exceed [-1, 1]; do not clip away spatial differences.
+        mono = left + right
+        diff = left - right
 
         center_sec = (start + self.sample_length / 2) / self.sample_rate
         prompt = prompt_for_center(self.prompt_cache[audio_id], center_sec)

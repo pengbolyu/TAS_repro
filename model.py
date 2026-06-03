@@ -175,9 +175,16 @@ class GaussianDiffusion(nn.Module):
         betas = torch.linspace(beta_start, beta_end, timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("posterior_variance", posterior_variance)
+        self.register_buffer("posterior_mean_coef1", posterior_mean_coef1)
+        self.register_buffer("posterior_mean_coef2", posterior_mean_coef2)
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
 
@@ -195,7 +202,27 @@ class GaussianDiffusion(nn.Module):
         return F.mse_loss(pred_noise, noise)
 
     @torch.no_grad()
-    def sample(self, mono: torch.Tensor, tokens, sample_steps: int = 50) -> torch.Tensor:
+    def sample(
+        self,
+        mono: torch.Tensor,
+        tokens,
+        sample_steps: int = 50,
+        clip_denoised: bool = False,
+        sampler: str = "ddim",
+    ) -> torch.Tensor:
+        if sampler == "ddpm":
+            return self.sample_ddpm(mono=mono, tokens=tokens, clip_denoised=clip_denoised)
+        if sampler != "ddim":
+            raise ValueError(f"Unknown sampler: {sampler}")
+        return self.sample_ddim(
+            mono=mono,
+            tokens=tokens,
+            sample_steps=sample_steps,
+            clip_denoised=clip_denoised,
+        )
+
+    @torch.no_grad()
+    def sample_ddim(self, mono: torch.Tensor, tokens, sample_steps: int = 50, clip_denoised: bool = False):
         self.model.eval()
         x = torch.randn_like(mono)
         steps = torch.linspace(self.timesteps - 1, 0, sample_steps, device=mono.device).long()
@@ -205,7 +232,8 @@ class GaussianDiffusion(nn.Module):
             pred_noise = self.model(x, mono, tokens, t)
             alpha_t = self.alphas_cumprod[timestep].view(1, 1, 1)
             pred_x0 = (x - torch.sqrt(1.0 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp_min(1e-8)
-            pred_x0 = pred_x0.clamp(-1.0, 1.0)
+            if clip_denoised:
+                pred_x0 = pred_x0.clamp(-1.0, 1.0)
 
             if i == len(steps) - 1:
                 x = pred_x0
@@ -213,10 +241,33 @@ class GaussianDiffusion(nn.Module):
                 prev_timestep = steps[i + 1]
                 alpha_prev = self.alphas_cumprod[prev_timestep].view(1, 1, 1)
                 x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1.0 - alpha_prev) * pred_noise
-        return x.clamp(-1.0, 1.0)
+        return x
+
+    @torch.no_grad()
+    def sample_ddpm(self, mono: torch.Tensor, tokens, clip_denoised: bool = False):
+        self.model.eval()
+        x = torch.randn_like(mono)
+        for timestep in range(self.timesteps - 1, -1, -1):
+            t = torch.full((mono.shape[0],), timestep, device=mono.device, dtype=torch.long)
+            pred_noise = self.model(x, mono, tokens, t)
+            alpha_t = self.alphas_cumprod[timestep].view(1, 1, 1)
+            pred_x0 = (x - torch.sqrt(1.0 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp_min(1e-8)
+            if clip_denoised:
+                pred_x0 = pred_x0.clamp(-1.0, 1.0)
+            mean = (
+                self.posterior_mean_coef1[timestep].view(1, 1, 1) * pred_x0
+                + self.posterior_mean_coef2[timestep].view(1, 1, 1) * x
+            )
+            if timestep > 0:
+                noise = torch.randn_like(x)
+                var = self.posterior_variance[timestep].view(1, 1, 1).clamp_min(1e-20)
+                x = mean + torch.sqrt(var) * noise
+            else:
+                x = mean
+        return x
 
 
 def binaural_from_mono_diff(mono: torch.Tensor, diff: torch.Tensor) -> torch.Tensor:
     left = (mono + diff) / 2.0
     right = (mono - diff) / 2.0
-    return torch.cat([left, right], dim=1).clamp(-1.0, 1.0)
+    return torch.cat([left, right], dim=1)

@@ -4,6 +4,14 @@ This is a small trainable reproduction scaffold for **TAS: Personalized Text-gui
 
 It uses a frozen `openai/clip-vit-base-patch32` text encoder and does not include paper metrics, inference overlap-add, or baseline comparisons.
 
+The data path follows the paper equations directly:
+
+- `mono = left + right`
+- `diff = left - right`
+- reconstructed `left = (mono + diff) / 2`, `right = (mono - diff) / 2`
+
+These internal tensors are not clipped to `[-1, 1]`; generated wav files are clipped only at write time if needed.
+
 The HRTF environment must have `transformers` installed. By default, CLIP is loaded from the local HuggingFace cache to avoid network retries. Add `--allow_model_download` only when the model is not cached yet.
 
 ## Fast smoke run
@@ -50,6 +58,8 @@ For longer listening samples, use sliding-window full-audio inference:
 ```
 
 `--mode full` uses 1-second windows with overlap-add. Smaller `--hop_sec` and larger `--sample_steps` improve continuity/quality but take longer.
+
+The default sampler is fast DDIM-like sampling. Use `--sampler ddpm` for a slower step-by-step reverse process closer to the paper's diffusion formulation.
 
 ## Analyze generated spatial cues
 

@@ -20,6 +20,8 @@ def parse_args():
     parser.add_argument("--start_sec", type=float, default=0.0)
     parser.add_argument("--hop_sec", type=float, default=0.25)
     parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--sampler", choices=["ddim", "ddpm"], default="ddim")
+    parser.add_argument("--clip_denoised", action="store_true")
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--device", default=None)
     parser.add_argument(
@@ -39,7 +41,7 @@ def load_mono(path: Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
         mono = waveform[0:1]
     if sr != sample_rate:
         mono = AF.resample(mono, orig_freq=sr, new_freq=sample_rate)
-    return mono.contiguous().clamp(-1.0, 1.0)
+    return mono.contiguous()
 
 
 def crop_mono_clip(
@@ -55,7 +57,7 @@ def crop_mono_clip(
         start = 0
     elif start + sample_length > total:
         start = total - sample_length
-    return mono[:, start : start + sample_length].unsqueeze(0).contiguous().clamp(-1.0, 1.0)
+    return mono[:, start : start + sample_length].unsqueeze(0).contiguous()
 
 
 def build_window_starts(total_samples: int, sample_length: int, hop_length: int):
@@ -88,8 +90,21 @@ def load_model_and_tokenizer(args):
 
 
 @torch.no_grad()
-def infer_clip(diffusion: GaussianDiffusion, mono_clip: torch.Tensor, tokens, sample_steps: int):
-    pred_diff = diffusion.sample(mono=mono_clip, tokens=tokens, sample_steps=sample_steps)
+def infer_clip(
+    diffusion: GaussianDiffusion,
+    mono_clip: torch.Tensor,
+    tokens,
+    sample_steps: int,
+    clip_denoised: bool,
+    sampler: str,
+):
+    pred_diff = diffusion.sample(
+        mono=mono_clip,
+        tokens=tokens,
+        sample_steps=sample_steps,
+        clip_denoised=clip_denoised,
+        sampler=sampler,
+    )
     return binaural_from_mono_diff(mono_clip, pred_diff)
 
 
@@ -101,6 +116,8 @@ def infer_full(
     sample_steps: int,
     hop_sec: float,
     device: torch.device,
+    clip_denoised: bool,
+    sampler: str,
 ):
     original_total = mono.shape[-1]
     if original_total < SAMPLE_LENGTH:
@@ -116,7 +133,13 @@ def infer_full(
 
     for index, start in enumerate(starts, start=1):
         mono_clip = mono[:, start : start + SAMPLE_LENGTH].unsqueeze(0)
-        pred_diff = diffusion.sample(mono=mono_clip, tokens=tokens, sample_steps=sample_steps).squeeze(0)
+        pred_diff = diffusion.sample(
+            mono=mono_clip,
+            tokens=tokens,
+            sample_steps=sample_steps,
+            clip_denoised=clip_denoised,
+            sampler=sampler,
+        ).squeeze(0)
         diff_sum[:, start : start + SAMPLE_LENGTH] += pred_diff * window
         weight_sum[:, start : start + SAMPLE_LENGTH] += window
         print(f"window {index}/{len(starts)} start={start / SAMPLE_RATE:.2f}s")
@@ -146,18 +169,38 @@ def main():
 
     if args.mode == "clip":
         mono_clip = crop_mono_clip(mono, args.start_sec).to(device)
-        binaural = infer_clip(diffusion, mono_clip, tokens, args.sample_steps)
+        binaural = infer_clip(
+            diffusion,
+            mono_clip,
+            tokens,
+            args.sample_steps,
+            args.clip_denoised,
+            args.sampler,
+        )
     else:
         print(
             f"full inference duration={mono.shape[-1] / SAMPLE_RATE:.2f}s "
             f"window={SAMPLE_LENGTH / SAMPLE_RATE:.2f}s hop={args.hop_sec:.2f}s "
-            f"sample_steps={args.sample_steps}"
+            f"sample_steps={args.sample_steps} sampler={args.sampler}"
         )
-        binaural = infer_full(diffusion, mono, tokens, args.sample_steps, args.hop_sec, device)
+        binaural = infer_full(
+            diffusion,
+            mono,
+            tokens,
+            args.sample_steps,
+            args.hop_sec,
+            device,
+            args.clip_denoised,
+            args.sampler,
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wav = binaural.squeeze(0).detach().cpu().transpose(0, 1).numpy()
+    peak = abs(wav).max()
+    if peak > 1.0:
+        print(f"warning: output peak {peak:.4f} exceeds 1.0; clipping before wav write")
+        wav = wav.clip(-1.0, 1.0)
     sf.write(str(out_path), wav, SAMPLE_RATE)
     print(f"saved: {out_path} sr={SAMPLE_RATE} channels=2 samples={wav.shape[0]}")
 
