@@ -50,3 +50,16 @@ For longer listening samples, use sliding-window full-audio inference:
 ```
 
 `--mode full` uses 1-second windows with overlap-add. Smaller `--hop_sec` and larger `--sample_steps` improve continuity/quality but take longer.
+
+## Analyze generated spatial cues
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\analyze_audio.py code\TAS_repro\runs\tas_smoke\sample_left.wav code\TAS_repro\runs\tas_smoke\sample_center.wav code\TAS_repro\runs\tas_smoke\sample_right.wav
+```
+
+Useful cues:
+
+- `ILD(dB)`: positive means left channel is louder; negative means right channel is louder.
+- `diff_rms`: left-right difference strength.
+- `lr_corr`: left/right waveform correlation; values near 1.0 are close to mono.
+- `side/mid`: side energy relative to mid energy.
