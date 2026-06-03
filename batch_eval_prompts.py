@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ import soundfile as sf
 import torch
 
 from analyze_audio import analyze
-from dataset import SAMPLE_RATE, discover_ids, make_splits
+from dataset import SAMPLE_RATE, discover_ids, load_prompts, make_splits
 from infer import crop_mono_clip, infer_clip, infer_full, load_model_and_tokenizer, load_mono
 
 
@@ -18,6 +19,34 @@ PROMPTS = {
     "center": "The sound source is in the center.",
     "right": "The sound source is on the right.",
 }
+
+
+def direction_prompts_for_object(object_phrase: str, verb: str):
+    return {
+        "left": f"The {object_phrase} {verb} on the left.",
+        "center": f"The {object_phrase} {verb} in the center.",
+        "right": f"The {object_phrase} {verb} on the right.",
+    }
+
+
+def extract_first_object(prompt: str):
+    match = re.search(r"^The\s+(.+?)\s+(is|are)\s+(?:on|in)\s+the\s+(?:left|right|center)", prompt)
+    if not match:
+        return "sound source", "is"
+    object_phrase = match.group(1).strip()
+    verb = match.group(2).strip()
+    if " and the " in object_phrase:
+        object_phrase = object_phrase.split(" and the ", 1)[0].strip()
+    return object_phrase, verb
+
+
+def prompts_for_audio(data_root: Path, audio_id: str, prompt_template: str):
+    if prompt_template == "generic":
+        return PROMPTS, "sound source", "The sound source is on the left."
+    prompts = load_prompts(data_root / "text_prompts" / f"{audio_id}.csv")
+    base_prompt = prompts[0]
+    object_phrase, verb = extract_first_object(base_prompt)
+    return direction_prompts_for_object(object_phrase, verb), object_phrase, base_prompt
 
 
 def parse_args():
@@ -33,6 +62,7 @@ def parse_args():
     parser.add_argument("--hop_sec", type=float, default=0.25)
     parser.add_argument("--sample_steps", type=int, default=20)
     parser.add_argument("--sampler", choices=["ddim", "ddpm"], default="ddim")
+    parser.add_argument("--prompt_template", choices=["object", "generic"], default="object")
     parser.add_argument("--clip_denoised", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow_model_download", action="store_true")
@@ -75,6 +105,10 @@ def center_between_ok(rows_by_direction):
     return low <= center_ild <= high
 
 
+def left_right_ok(rows_by_direction):
+    return rows_by_direction["left"]["ild_db"] > rows_by_direction["right"]["ild_db"]
+
+
 def main():
     args = parse_args()
     if args.hop_sec <= 0:
@@ -100,13 +134,17 @@ def main():
     rows = []
     correct_order = 0
     center_between = 0
+    left_right_correct = 0
+    left_right_deltas = []
+    center_abs_ild = []
     for item_index, audio_id in enumerate(selected_ids, start=1):
         wav_path = Path(args.data_root) / "binaural_audios" / f"{audio_id}.wav"
         mono = load_mono(wav_path)
         rows_by_direction = {}
-        print(f"[{item_index}/{len(selected_ids)}] audio_id={audio_id}")
+        prompts, object_phrase, base_prompt = prompts_for_audio(Path(args.data_root), audio_id, args.prompt_template)
+        print(f"[{item_index}/{len(selected_ids)}] audio_id={audio_id} object={object_phrase} base_prompt=\"{base_prompt}\"")
 
-        for direction, prompt in PROMPTS.items():
+        for direction, prompt in prompts.items():
             torch.manual_seed(args.seed)
             torch.cuda.manual_seed_all(args.seed)
             tokens = tokenizer.batch_encode([prompt])
@@ -145,6 +183,9 @@ def main():
                     "mode": args.mode,
                     "sampler": args.sampler,
                     "sample_steps": args.sample_steps,
+                    "prompt_template": args.prompt_template,
+                    "object_phrase": object_phrase,
+                    "base_prompt": base_prompt,
                 }
             )
             rows.append(row)
@@ -156,9 +197,19 @@ def main():
 
         is_correct = direction_order_ok(rows_by_direction)
         is_center_between = center_between_ok(rows_by_direction)
+        is_left_right = left_right_ok(rows_by_direction)
+        left_right_delta = rows_by_direction["left"]["ild_db"] - rows_by_direction["right"]["ild_db"]
         correct_order += int(is_correct)
         center_between += int(is_center_between)
-        print(f"  order_left_gt_center_gt_right={is_correct} center_between_left_right={is_center_between}")
+        left_right_correct += int(is_left_right)
+        left_right_deltas.append(left_right_delta)
+        center_abs_ild.append(abs(rows_by_direction["center"]["ild_db"]))
+        print(
+            f"  order_left_gt_center_gt_right={is_correct} "
+            f"left_gt_right={is_left_right} "
+            f"delta_left_right={left_right_delta:.4f} "
+            f"center_between_left_right={is_center_between}"
+        )
 
     metrics_path = out_dir / "prompt_eval_metrics.csv"
     keys = [
@@ -168,6 +219,9 @@ def main():
         "mode",
         "sampler",
         "sample_steps",
+        "prompt_template",
+        "object_phrase",
+        "base_prompt",
         "duration_sec",
         "ild_db",
         "diff_rms",
@@ -189,8 +243,12 @@ def main():
         "mode": args.mode,
         "sampler": args.sampler,
         "sample_steps": args.sample_steps,
+        "prompt_template": args.prompt_template,
         "order_accuracy_left_gt_center_gt_right": correct_order / max(len(selected_ids), 1),
+        "left_vs_right_accuracy": left_right_correct / max(len(selected_ids), 1),
         "center_between_accuracy": center_between / max(len(selected_ids), 1),
+        "mean_delta_ild_left_minus_right": float(np.mean(left_right_deltas)) if left_right_deltas else 0.0,
+        "mean_abs_center_ild": float(np.mean(center_abs_ild)) if center_abs_ild else 0.0,
         "mean_abs_ild": float(np.mean([abs(row["ild_db"]) for row in rows])) if rows else 0.0,
         "mean_diff_rms": float(np.mean([row["diff_rms"] for row in rows])) if rows else 0.0,
         "metrics_csv": str(metrics_path),

@@ -82,4 +82,6 @@ Generate left/center/right prompts for multiple TASBench items and summarize whe
 & "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\batch_eval_prompts.py --checkpoint code\TAS_repro\runs\paper_formula\best.pt --data_root data\TASBench --split val --num_items 20 --mode clip --sample_steps 20 --sampler ddim --out_dir code\TAS_repro\runs\prompt_eval
 ```
 
+By default, prompts reuse the first object name from each item's TASBench CSV, for example `The keyboard is on the left.` Set `--prompt_template generic` to use `The sound source ...` prompts instead.
+
 For listening-ready full-audio evaluation, add `--mode full --hop_sec 0.25 --save_audio`, but it will be much slower and writes three wav files per item.
