@@ -85,7 +85,12 @@ def load_model_and_tokenizer(args):
         hidden_channels=int(ckpt_args.get("hidden_channels", 64)),
     )
     model.load_state_dict(checkpoint["model"])
-    diffusion = GaussianDiffusion(model, timesteps=int(ckpt_args.get("timesteps", 1000)))
+    diffusion = GaussianDiffusion(
+        model,
+        timesteps=int(ckpt_args.get("timesteps", 1000)),
+        diff_loss_weight=float(ckpt_args.get("diff_loss_weight", 0.1)),
+        ild_loss_weight=float(ckpt_args.get("ild_loss_weight", 0.1)),
+    )
     return diffusion, tokenizer
 
 

@@ -3,7 +3,7 @@ import random
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import soundfile as sf
 import torch
@@ -16,6 +16,7 @@ SAMPLE_RATE = 16000
 SAMPLE_SECONDS = 1.0
 SAMPLE_LENGTH = int(SAMPLE_RATE * SAMPLE_SECONDS)
 PROMPT_FPS = 10.0
+DIRECTION_CATEGORIES = ("left", "center", "right", "mixed")
 
 
 def discover_ids(data_root: Path) -> List[str]:
@@ -58,6 +59,15 @@ def prompt_for_center(prompts: Sequence[str], center_sec: float) -> str:
     frame_index = int(round(center_sec * PROMPT_FPS))
     frame_index = max(0, min(frame_index, len(prompts) - 1))
     return prompts[frame_index]
+
+
+def classify_prompt_direction(prompt: str) -> str:
+    directions = set(re.findall(r"\b(left|center|right)\b", prompt.lower()))
+    if len(directions) == 1:
+        return next(iter(directions))
+    if len(directions) > 1:
+        return "mixed"
+    return "none"
 
 
 class SimpleTokenizer:
@@ -138,6 +148,8 @@ class TASBenchDataset(Dataset):
         split: str = "train",
         sample_rate: int = SAMPLE_RATE,
         sample_length: int = SAMPLE_LENGTH,
+        balanced_direction_sampling: bool = False,
+        prompt_jitter_sec: float = 0.045,
     ):
         self.data_root = Path(data_root)
         self.audio_dir = self.data_root / "binaural_audios"
@@ -146,17 +158,67 @@ class TASBenchDataset(Dataset):
         self.split = split
         self.sample_rate = sample_rate
         self.sample_length = sample_length
+        self.balanced_direction_sampling = balanced_direction_sampling and split == "train"
+        self.prompt_jitter_sec = prompt_jitter_sec
 
         self.prompt_cache = {
             audio_id: load_prompts(self.prompt_dir / f"{audio_id}.csv")
             for audio_id in self.ids
         }
+        self.direction_candidates: Dict[str, List[Tuple[str, int]]] = {
+            category: [] for category in DIRECTION_CATEGORIES
+        }
+        self.mixed_sampling_probability = 0.0
+        if self.balanced_direction_sampling:
+            self._build_direction_candidates()
+
+    def _build_direction_candidates(self):
+        for audio_id in self.ids:
+            info = sf.info(str(self.audio_dir / f"{audio_id}.wav"))
+            duration_sec = info.frames / info.samplerate
+            prompts = self.prompt_cache[audio_id]
+            for frame_index, prompt in enumerate(prompts):
+                center_sec = frame_index / PROMPT_FPS
+                if center_sec - SAMPLE_SECONDS / 2 < 0:
+                    continue
+                if center_sec + SAMPLE_SECONDS / 2 > duration_sec:
+                    continue
+                category = classify_prompt_direction(prompt)
+                if category in self.direction_candidates:
+                    self.direction_candidates[category].append((audio_id, frame_index))
+
+        empty = [category for category, candidates in self.direction_candidates.items() if not candidates]
+        if empty:
+            raise RuntimeError(f"Direction-balanced sampling has empty candidate pools: {empty}")
+        total = sum(len(candidates) for candidates in self.direction_candidates.values())
+        self.mixed_sampling_probability = len(self.direction_candidates["mixed"]) / total
+
+    def direction_sampling_summary(self) -> Dict[str, object]:
+        counts = {category: len(candidates) for category, candidates in self.direction_candidates.items()}
+        return {
+            "candidate_counts": counts,
+            "mixed_sampling_probability": self.mixed_sampling_probability,
+            "single_direction_probability": (1.0 - self.mixed_sampling_probability) / 3.0,
+        }
+
+    def _sample_balanced_candidate(self) -> Tuple[str, int, str]:
+        if random.random() < self.mixed_sampling_probability:
+            category = "mixed"
+        else:
+            category = random.choice(("left", "center", "right"))
+        audio_id, frame_index = random.choice(self.direction_candidates[category])
+        return audio_id, frame_index, category
 
     def __len__(self) -> int:
         return len(self.ids)
 
     def __getitem__(self, index: int) -> Dict[str, object]:
-        audio_id = self.ids[index]
+        selected_frame_index = None
+        selected_category = None
+        if self.balanced_direction_sampling:
+            audio_id, selected_frame_index, selected_category = self._sample_balanced_candidate()
+        else:
+            audio_id = self.ids[index]
         wav_path = self.audio_dir / f"{audio_id}.wav"
         audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
         waveform = torch.from_numpy(audio).transpose(0, 1)
@@ -170,7 +232,12 @@ class TASBenchDataset(Dataset):
             waveform = F.pad(waveform, (0, self.sample_length - total))
             total = waveform.shape[-1]
 
-        if self.split == "train":
+        if selected_frame_index is not None:
+            center_sec = selected_frame_index / PROMPT_FPS
+            jitter_sec = random.uniform(-self.prompt_jitter_sec, self.prompt_jitter_sec)
+            start = int(round((center_sec - SAMPLE_SECONDS / 2 + jitter_sec) * self.sample_rate))
+            start = max(0, min(start, total - self.sample_length))
+        elif self.split == "train":
             start = random.randint(0, total - self.sample_length)
         else:
             start = max(0, (total - self.sample_length) // 2)
@@ -184,10 +251,12 @@ class TASBenchDataset(Dataset):
 
         center_sec = (start + self.sample_length / 2) / self.sample_rate
         prompt = prompt_for_center(self.prompt_cache[audio_id], center_sec)
+        direction_category = selected_category or classify_prompt_direction(prompt)
         return {
             "mono": mono,
             "diff": diff,
             "prompt": prompt,
+            "direction_category": direction_category,
             "audio_id": audio_id,
             "start_sec": float(start / self.sample_rate),
         }
@@ -204,6 +273,7 @@ class TASCollator:
             "diff": torch.stack([item["diff"] for item in batch]),
             "tokens": self.tokenizer.batch_encode(prompts),
             "prompts": prompts,
+            "direction_categories": [item["direction_category"] for item in batch],
             "audio_ids": [item["audio_id"] for item in batch],
             "start_sec": torch.tensor([item["start_sec"] for item in batch], dtype=torch.float32),
         }

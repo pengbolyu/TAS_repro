@@ -23,22 +23,34 @@ The HRTF environment must have `transformers` installed. By default, CLIP is loa
 ## Normal training start
 
 ```powershell
-& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\train.py --data_root data\TASBench --batch_size 12 --max_steps 3000 --lr 2e-4 --val_interval 200 --val_batches 20
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\train.py --data_root data\TASBench --run_dir code\TAS_repro\runs\direction_enhanced --batch_size 12 --max_steps 3000 --lr 2e-4 --val_interval 200 --val_batches 20
 ```
 
 If CUDA memory is insufficient, reduce `--batch_size` or `--hidden_channels`.
 
-`last.pt` is always updated during training. `best.pt` is saved when validation loss improves.
+Direction-enhanced training defaults to:
+
+- `hidden_channels=128`
+- balanced left/center/right prompt-frame sampling while preserving the natural mixed-direction ratio
+- `total_loss = noise_mse + 0.1 * diff_l1 + 0.1 * ild_loss`
+
+Use `--no_balanced_direction_sampling`, `--diff_loss_weight`, `--ild_loss_weight`, or
+`--hidden_channels` for ablation runs.
+
+`last.pt` is always updated during training. `best.pt` is saved when the combined validation
+`total_loss` improves.
 
 Training also writes:
 
-- TensorBoard events: `code/TAS_repro/runs/tas_smoke/tensorboard`
-- Text log: `code/TAS_repro/runs/tas_smoke/train.log`
+- TensorBoard events: `<run_dir>/tensorboard`
+- Text log: `<run_dir>/train.log`
+
+Both outputs include the four loss components and cumulative sampled direction ratios.
 
 To view curves:
 
 ```powershell
-& "F:\Anaconda\envs\HRTF\python.exe" -m tensorboard --logdir code\TAS_repro\runs\tas_smoke\tensorboard --port 6006
+& "F:\Anaconda\envs\HRTF\python.exe" -m tensorboard --logdir code\TAS_repro\runs\direction_enhanced\tensorboard --port 6006
 ```
 
 Then open `http://localhost:6006`.

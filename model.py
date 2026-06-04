@@ -116,7 +116,7 @@ class TASDiffusionNet(nn.Module):
         text_model_name: str = "openai/clip-vit-base-patch32",
         local_files_only: bool = True,
         feature_dim: int = 512,
-        hidden_channels: int = 64,
+        hidden_channels: int = 128,
         time_dim: int = 128,
         residual_blocks: int = 3,
         dilated_layers: int = 10,
@@ -168,10 +168,20 @@ class TASDiffusionNet(nn.Module):
 
 
 class GaussianDiffusion(nn.Module):
-    def __init__(self, model: nn.Module, timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
+    def __init__(
+        self,
+        model: nn.Module,
+        timesteps: int = 1000,
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
+        diff_loss_weight: float = 0.1,
+        ild_loss_weight: float = 0.1,
+    ):
         super().__init__()
         self.model = model
         self.timesteps = timesteps
+        self.diff_loss_weight = diff_loss_weight
+        self.ild_loss_weight = ild_loss_weight
         betas = torch.linspace(beta_start, beta_end, timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -193,13 +203,45 @@ class GaussianDiffusion(nn.Module):
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1)
         return sqrt_alpha * x_start + sqrt_one_minus * noise
 
-    def training_loss(self, diff: torch.Tensor, mono: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    def predict_x0_from_noise(
+        self,
+        noisy_diff: torch.Tensor,
+        timesteps: torch.Tensor,
+        pred_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        sqrt_alpha = self.sqrt_alphas_cumprod[timesteps].view(-1, 1, 1)
+        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1)
+        return (noisy_diff - sqrt_one_minus * pred_noise) / sqrt_alpha.clamp_min(1e-8)
+
+    @staticmethod
+    def ild_db(mono: torch.Tensor, diff: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        binaural = binaural_from_mono_diff(mono, diff)
+        left_rms = binaural[:, 0].square().mean(dim=-1).add(eps).sqrt()
+        right_rms = binaural[:, 1].square().mean(dim=-1).add(eps).sqrt()
+        return 20.0 * torch.log10((left_rms + eps) / (right_rms + eps))
+
+    def training_loss(self, diff: torch.Tensor, mono: torch.Tensor, tokens: torch.Tensor) -> dict:
         batch = diff.shape[0]
         timesteps = torch.randint(0, self.timesteps, (batch,), device=diff.device)
         noise = torch.randn_like(diff)
         noisy_diff = self.q_sample(diff, timesteps, noise)
         pred_noise = self.model(noisy_diff, mono, tokens, timesteps)
-        return F.mse_loss(pred_noise, noise)
+        pred_diff = self.predict_x0_from_noise(noisy_diff, timesteps, pred_noise)
+
+        noise_mse = F.mse_loss(pred_noise, noise)
+        aux_weight = self.sqrt_alphas_cumprod[timesteps]
+        diff_l1_per_sample = (pred_diff - diff).abs().mean(dim=(1, 2))
+        diff_l1 = (aux_weight * diff_l1_per_sample).mean()
+        true_ild = self.ild_db(mono, diff)
+        pred_ild = self.ild_db(mono, pred_diff)
+        ild_loss = (aux_weight * (pred_ild - true_ild).abs()).mean()
+        total_loss = noise_mse + self.diff_loss_weight * diff_l1 + self.ild_loss_weight * ild_loss
+        return {
+            "total_loss": total_loss,
+            "noise_mse": noise_mse,
+            "diff_l1": diff_l1,
+            "ild_loss": ild_loss,
+        }
 
     @torch.no_grad()
     def sample(

@@ -2,7 +2,7 @@ import argparse
 import json
 import random
 import time
-from collections import deque
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 import torch
@@ -33,12 +33,28 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=200)
     parser.add_argument("--val_interval", type=int, default=200)
     parser.add_argument("--val_batches", type=int, default=20)
-    parser.add_argument("--best_metric", default="val_loss", choices=["val_loss"])
+    parser.add_argument("--best_metric", default="val_total_loss", choices=["val_total_loss"])
     parser.add_argument("--log_file", default=None)
     parser.add_argument("--tensorboard_dir", default=None)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--feature_dim", type=int, default=512)
-    parser.add_argument("--hidden_channels", type=int, default=64)
+    parser.add_argument("--hidden_channels", type=int, default=128)
+    parser.add_argument("--diff_loss_weight", type=float, default=0.1)
+    parser.add_argument("--ild_loss_weight", type=float, default=0.1)
+    balance_group = parser.add_mutually_exclusive_group()
+    balance_group.add_argument(
+        "--balanced_direction_sampling",
+        dest="balanced_direction_sampling",
+        action="store_true",
+        help="Balance left/center/right prompt frames while preserving the natural mixed-direction ratio.",
+    )
+    balance_group.add_argument(
+        "--no_balanced_direction_sampling",
+        dest="balanced_direction_sampling",
+        action="store_false",
+        help="Disable direction-balanced prompt-frame sampling.",
+    )
+    parser.set_defaults(balanced_direction_sampling=True)
     parser.add_argument("--text_model_name", default="openai/clip-vit-base-patch32")
     parser.add_argument(
         "--allow_model_download",
@@ -65,6 +81,7 @@ def save_checkpoint(path: Path, step: int, diffusion: GaussianDiffusion, optimiz
             "tokenizer_vocab": tokenizer.vocab,
             "text_model_name": tokenizer.model_name,
             "best_val_loss": best_val_loss,
+            "best_val_total_loss": best_val_loss,
             "args": vars(args),
         },
         path,
@@ -89,21 +106,33 @@ class RunLogger:
 
 
 @torch.no_grad()
-def validate(diffusion: GaussianDiffusion, val_loader: DataLoader, device: torch.device, max_batches: int) -> float:
+def validate(diffusion: GaussianDiffusion, val_loader: DataLoader, device: torch.device, max_batches: int) -> dict:
     diffusion.eval()
-    losses = []
+    losses = defaultdict(list)
     for batch_idx, batch in enumerate(val_loader):
         if batch_idx >= max_batches:
             break
         mono = batch["mono"].to(device, non_blocking=True)
         diff = batch["diff"].to(device, non_blocking=True)
         tokens = {key: value.to(device, non_blocking=True) for key, value in batch["tokens"].items()}
-        loss = diffusion.training_loss(diff=diff, mono=mono, tokens=tokens)
-        losses.append(loss.item())
+        batch_losses = diffusion.training_loss(diff=diff, mono=mono, tokens=tokens)
+        for name, value in batch_losses.items():
+            losses[name].append(value.item())
     diffusion.train()
     if not losses:
         raise RuntimeError("Validation loader produced no batches.")
-    return sum(losses) / len(losses)
+    return {name: sum(values) / len(values) for name, values in losses.items()}
+
+
+def format_loss_values(losses: dict) -> str:
+    return " ".join(f"{name}={value:.6f}" for name, value in losses.items())
+
+
+def direction_ratios(counts: Counter) -> dict:
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    return {category: counts[category] / total for category in ("left", "center", "right", "mixed", "none")}
 
 
 def main():
@@ -130,7 +159,12 @@ def main():
 
     local_files_only = not args.allow_model_download
     tokenizer = CLIPPromptTokenizer(model_name=args.text_model_name, local_files_only=local_files_only)
-    train_set = TASBenchDataset(args.data_root, splits["train"], split="train")
+    train_set = TASBenchDataset(
+        args.data_root,
+        splits["train"],
+        split="train",
+        balanced_direction_sampling=args.balanced_direction_sampling,
+    )
     val_set = TASBenchDataset(args.data_root, splits["val"], split="val")
     train_loader = DataLoader(
         train_set,
@@ -162,7 +196,12 @@ def main():
         feature_dim=args.feature_dim,
         hidden_channels=args.hidden_channels,
     )
-    diffusion = GaussianDiffusion(model, timesteps=args.timesteps).to(device)
+    diffusion = GaussianDiffusion(
+        model,
+        timesteps=args.timesteps,
+        diff_loss_weight=args.diff_loss_weight,
+        ild_loss_weight=args.ild_loss_weight,
+    ).to(device)
     optimizer = torch.optim.Adam(diffusion.parameters(), lr=args.lr)
 
     logger.write(
@@ -172,13 +211,16 @@ def main():
     logger.write(f"run_dir={run_dir}")
     logger.write(f"tensorboard_dir={tb_dir}")
     logger.write(f"args={json.dumps(vars(args), sort_keys=True)}")
+    if args.balanced_direction_sampling:
+        logger.write(f"direction_sampling={json.dumps(train_set.direction_sampling_summary(), sort_keys=True)}")
     writer.add_text("run/args", json.dumps(vars(args), indent=2, sort_keys=True), global_step=0)
     writer.add_scalar("run/train_items", len(train_set), 0)
     writer.add_scalar("run/val_items", len(val_set), 0)
 
     step = 0
     best_val_loss = None
-    recent_losses = deque(maxlen=100)
+    recent_losses = defaultdict(lambda: deque(maxlen=100))
+    sampled_directions = Counter()
     progress = tqdm(total=args.max_steps, desc="train", dynamic_ncols=True)
     while step < args.max_steps:
         for batch in train_loader:
@@ -189,35 +231,60 @@ def main():
             tokens = {key: value.to(device, non_blocking=True) for key, value in batch["tokens"].items()}
 
             optimizer.zero_grad(set_to_none=True)
-            loss = diffusion.training_loss(diff=diff, mono=mono, tokens=tokens)
+            batch_losses = diffusion.training_loss(diff=diff, mono=mono, tokens=tokens)
+            loss = batch_losses["total_loss"]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(diffusion.parameters(), 1.0)
             optimizer.step()
-            recent_losses.append(loss.item())
+            for name, value in batch_losses.items():
+                recent_losses[name].append(value.item())
+            sampled_directions.update(batch["direction_categories"])
 
             progress.update(1)
             if step % args.log_interval == 0 or step == 1:
-                train_avg = sum(recent_losses) / len(recent_losses)
-                progress.set_postfix(loss=f"{loss.item():.4f}", train_avg=f"{train_avg:.4f}")
-                logger.write(f"step={step} loss={loss.item():.6f} train_loss_avg={train_avg:.6f}")
-                writer.add_scalar("loss/train_step", loss.item(), step)
-                writer.add_scalar("loss/train_avg_100", train_avg, step)
+                train_avg = {
+                    name: sum(values) / len(values)
+                    for name, values in recent_losses.items()
+                }
+                ratios = direction_ratios(sampled_directions)
+                progress.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    train_avg=f"{train_avg['total_loss']:.4f}",
+                )
+                logger.write(
+                    f"step={step} train_step[{format_loss_values({name: value.item() for name, value in batch_losses.items()})}] "
+                    f"train_avg_100[{format_loss_values(train_avg)}] "
+                    f"direction_counts={dict(sampled_directions)} direction_ratios={ratios}"
+                )
+                for name, value in batch_losses.items():
+                    writer.add_scalar(f"loss/train_step/{name}", value.item(), step)
+                for name, value in train_avg.items():
+                    writer.add_scalar(f"loss/train_avg_100/{name}", value, step)
+                for category, ratio in ratios.items():
+                    writer.add_scalar(f"sampling/direction_ratio/{category}", ratio, step)
+                    writer.add_scalar(f"sampling/direction_count/{category}", sampled_directions[category], step)
                 writer.add_scalar("optim/lr", optimizer.param_groups[0]["lr"], step)
 
             if step % args.val_interval == 0 or step == args.max_steps:
-                val_loss = validate(diffusion, val_loader, device, args.val_batches)
-                train_avg = sum(recent_losses) / len(recent_losses)
+                val_losses = validate(diffusion, val_loader, device, args.val_batches)
+                train_avg = {
+                    name: sum(values) / len(values)
+                    for name, values in recent_losses.items()
+                }
+                val_loss = val_losses["total_loss"]
                 logger.write(
-                    f"step={step} train_loss_avg={train_avg:.6f} "
-                    f"val_loss={val_loss:.6f} val_batches={args.val_batches}"
+                    f"step={step} train_avg_100[{format_loss_values(train_avg)}] "
+                    f"val[{format_loss_values(val_losses)}] val_batches={args.val_batches}"
                 )
-                writer.add_scalar("loss/val", val_loss, step)
-                writer.add_scalar("loss/train_avg_at_val", train_avg, step)
+                for name, value in val_losses.items():
+                    writer.add_scalar(f"loss/val/{name}", value, step)
+                for name, value in train_avg.items():
+                    writer.add_scalar(f"loss/train_avg_at_val/{name}", value, step)
                 if best_val_loss is None or val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_checkpoint(run_dir / "best.pt", step, diffusion, optimizer, tokenizer, args, best_val_loss)
-                    logger.write(f"saved best checkpoint: {run_dir / 'best.pt'} val_loss={best_val_loss:.6f}")
-                    writer.add_scalar("loss/best_val", best_val_loss, step)
+                    logger.write(f"saved best checkpoint: {run_dir / 'best.pt'} val_total_loss={best_val_loss:.6f}")
+                    writer.add_scalar("loss/best_val_total_loss", best_val_loss, step)
 
             if step % args.save_interval == 0 or step == args.max_steps:
                 save_checkpoint(run_dir / "last.pt", step, diffusion, optimizer, tokenizer, args, best_val_loss)
