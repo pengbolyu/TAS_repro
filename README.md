@@ -84,7 +84,7 @@ Generate left/center/right prompts for multiple TASBench items and summarize whe
 
 By default, prompts reuse the first object name from each item's TASBench CSV, for example `The keyboard is on the left.` Set `--prompt_template generic` to use `The sound source ...` prompts instead.
 
-For a cleaner ILD sanity check, restrict evaluation to single-source clips:
+For a cleaner ILD sanity check, restrict evaluation to prompts containing one object and one spatial relation. This filters both multi-direction prompts and phrases such as `female vocals and piano`:
 
 ```powershell
 & "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\batch_eval_prompts.py --checkpoint code\TAS_repro\runs\paper_formula\best.pt --data_root data\TASBench --split val --num_items 20 --mode clip --sample_steps 20 --sampler ddim --single_source_only --out_dir code\TAS_repro\runs\prompt_eval_single_source

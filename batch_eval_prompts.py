@@ -42,7 +42,9 @@ def extract_first_object(prompt: str):
 
 def is_single_source_prompt(prompt: str):
     matches = re.findall(r"\b(?:is|are)\s+(?:on|in)\s+the\s+(?:left|right|center)\b", prompt)
-    return len(matches) == 1
+    object_phrase, _ = extract_first_object(prompt)
+    has_multiple_objects = bool(re.search(r"\band\b", object_phrase, flags=re.IGNORECASE))
+    return len(matches) == 1 and not has_multiple_objects
 
 
 def prompts_for_audio(data_root: Path, audio_id: str, prompt_template: str):
