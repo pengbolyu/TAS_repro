@@ -39,6 +39,12 @@ def parse_args():
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--feature_dim", type=int, default=512)
     parser.add_argument("--hidden_channels", type=int, default=128)
+    parser.add_argument("--condition_type", choices=["text", "angle"], default="text")
+    parser.add_argument(
+        "--angle_single_direction_only",
+        action="store_true",
+        help="For angle conditioning, drop prompts with multiple directions but keep multi-object same-direction prompts.",
+    )
     parser.add_argument("--diff_loss_weight", type=float, default=0.1)
     parser.add_argument("--ild_loss_weight", type=float, default=0.1)
     balance_group = parser.add_mutually_exclusive_group()
@@ -78,8 +84,8 @@ def save_checkpoint(path: Path, step: int, diffusion: GaussianDiffusion, optimiz
             "step": step,
             "model": diffusion.model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "tokenizer_vocab": tokenizer.vocab,
-            "text_model_name": tokenizer.model_name,
+            "tokenizer_vocab": tokenizer.vocab if tokenizer is not None else {},
+            "text_model_name": tokenizer.model_name if tokenizer is not None else None,
             "best_val_loss": best_val_loss,
             "best_val_total_loss": best_val_loss,
             "args": vars(args),
@@ -114,7 +120,7 @@ def validate(diffusion: GaussianDiffusion, val_loader: DataLoader, device: torch
             break
         mono = batch["mono"].to(device, non_blocking=True)
         diff = batch["diff"].to(device, non_blocking=True)
-        tokens = {key: value.to(device, non_blocking=True) for key, value in batch["tokens"].items()}
+        tokens = move_conditioning_to_device(batch["tokens"], device)
         batch_losses = diffusion.training_loss(diff=diff, mono=mono, tokens=tokens)
         for name, value in batch_losses.items():
             losses[name].append(value.item())
@@ -135,8 +141,14 @@ def direction_ratios(counts: Counter) -> dict:
     return {category: counts[category] / total for category in ("left", "center", "right", "mixed", "none")}
 
 
+def move_conditioning_to_device(conditioning: dict, device: torch.device) -> dict:
+    return {key: value.to(device, non_blocking=True) for key, value in conditioning.items()}
+
+
 def main():
     args = parse_args()
+    if args.condition_type == "angle" and not args.angle_single_direction_only:
+        raise ValueError("--condition_type angle requires --angle_single_direction_only.")
     if args.fast_dev_run:
         args.max_steps = min(args.max_steps, 2)
         args.log_interval = 1
@@ -158,14 +170,26 @@ def main():
     (run_dir / f"split_seed{args.seed}.json").write_text(json.dumps(splits, indent=2), encoding="utf-8")
 
     local_files_only = not args.allow_model_download
-    tokenizer = CLIPPromptTokenizer(model_name=args.text_model_name, local_files_only=local_files_only)
+    tokenizer = None
+    if args.condition_type == "text":
+        tokenizer = CLIPPromptTokenizer(model_name=args.text_model_name, local_files_only=local_files_only)
     train_set = TASBenchDataset(
         args.data_root,
         splits["train"],
         split="train",
         balanced_direction_sampling=args.balanced_direction_sampling,
+        condition_type=args.condition_type,
+        angle_single_direction_only=args.angle_single_direction_only,
+        candidate_seed=args.seed,
     )
-    val_set = TASBenchDataset(args.data_root, splits["val"], split="val")
+    val_set = TASBenchDataset(
+        args.data_root,
+        splits["val"],
+        split="val",
+        condition_type=args.condition_type,
+        angle_single_direction_only=args.angle_single_direction_only,
+        candidate_seed=args.seed,
+    )
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -195,6 +219,7 @@ def main():
         local_files_only=local_files_only,
         feature_dim=args.feature_dim,
         hidden_channels=args.hidden_channels,
+        condition_type=args.condition_type,
     )
     diffusion = GaussianDiffusion(
         model,
@@ -206,12 +231,13 @@ def main():
 
     logger.write(
         f"device={device} train_items={len(train_set)} val_items={len(val_set)} "
-        f"text_model={args.text_model_name} max_steps={args.max_steps}"
+        f"condition_type={args.condition_type} text_model={args.text_model_name if args.condition_type == 'text' else 'none'} "
+        f"max_steps={args.max_steps}"
     )
     logger.write(f"run_dir={run_dir}")
     logger.write(f"tensorboard_dir={tb_dir}")
     logger.write(f"args={json.dumps(vars(args), sort_keys=True)}")
-    if args.balanced_direction_sampling:
+    if args.balanced_direction_sampling or args.angle_single_direction_only:
         logger.write(f"direction_sampling={json.dumps(train_set.direction_sampling_summary(), sort_keys=True)}")
     writer.add_text("run/args", json.dumps(vars(args), indent=2, sort_keys=True), global_step=0)
     writer.add_scalar("run/train_items", len(train_set), 0)
@@ -228,7 +254,7 @@ def main():
             diffusion.train()
             mono = batch["mono"].to(device, non_blocking=True)
             diff = batch["diff"].to(device, non_blocking=True)
-            tokens = {key: value.to(device, non_blocking=True) for key, value in batch["tokens"].items()}
+            tokens = move_conditioning_to_device(batch["tokens"], device)
 
             optimizer.zero_grad(set_to_none=True)
             batch_losses = diffusion.training_loss(diff=diff, mono=mono, tokens=tokens)

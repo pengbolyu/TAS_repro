@@ -10,8 +10,8 @@ import soundfile as sf
 import torch
 
 from analyze_audio import analyze
-from dataset import SAMPLE_RATE, discover_ids, load_prompts, make_splits
-from infer import crop_mono_clip, infer_clip, infer_full, load_model_and_tokenizer, load_mono
+from dataset import SAMPLE_RATE, discover_ids, is_single_direction_prompt, load_prompts, make_splits
+from infer import build_conditioning, crop_mono_clip, infer_clip, infer_full, load_model_and_tokenizer, load_mono
 
 
 PROMPTS = {
@@ -71,6 +71,11 @@ def parse_args():
     parser.add_argument("--sampler", choices=["ddim", "ddpm"], default="ddim")
     parser.add_argument("--prompt_template", choices=["object", "generic"], default="object")
     parser.add_argument("--single_source_only", action="store_true")
+    parser.add_argument(
+        "--single_direction_only",
+        action="store_true",
+        help="Keep prompts with one unique direction, including multi-object same-direction prompts.",
+    )
     parser.add_argument("--clip_denoised", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow_model_download", action="store_true")
@@ -133,11 +138,16 @@ def main():
     split_ids = make_splits(ids, seed=args.seed)[args.split]
     selected_ids = list(split_ids)
     skipped_multi_source = 0
-    if args.single_source_only:
+    if args.single_source_only or args.single_direction_only:
         filtered_ids = []
         for audio_id in selected_ids:
             prompts = load_prompts(Path(args.data_root) / "text_prompts" / f"{audio_id}.csv")
-            if is_single_source_prompt(prompts[0]):
+            keep = True
+            if args.single_source_only:
+                keep = keep and is_single_source_prompt(prompts[0])
+            if args.single_direction_only:
+                keep = keep and is_single_direction_prompt(prompts[0])
+            if keep:
                 filtered_ids.append(audio_id)
             else:
                 skipped_multi_source += 1
@@ -147,7 +157,7 @@ def main():
     rng.shuffle(selected_ids)
     selected_ids = selected_ids[: args.num_items]
 
-    diffusion, tokenizer = load_model_and_tokenizer(args)
+    diffusion, tokenizer, condition_type = load_model_and_tokenizer(args)
     diffusion = diffusion.to(device)
     diffusion.eval()
 
@@ -167,8 +177,7 @@ def main():
         for direction, prompt in prompts.items():
             torch.manual_seed(args.seed)
             torch.cuda.manual_seed_all(args.seed)
-            tokens = tokenizer.batch_encode([prompt])
-            tokens = {key: value.to(device) for key, value in tokens.items()}
+            tokens = build_conditioning(prompt, None, tokenizer, condition_type, device)
             if args.mode == "clip":
                 mono_clip = crop_mono_clip(mono, args.start_sec).to(device)
                 binaural = infer_clip(
@@ -204,6 +213,7 @@ def main():
                     "sampler": args.sampler,
                     "sample_steps": args.sample_steps,
                     "prompt_template": args.prompt_template,
+                    "condition_type": condition_type,
                     "object_phrase": object_phrase,
                     "base_prompt": base_prompt,
                     "is_single_source": is_single_source_prompt(base_prompt),
@@ -241,6 +251,7 @@ def main():
         "sampler",
         "sample_steps",
         "prompt_template",
+        "condition_type",
         "object_phrase",
         "base_prompt",
         "is_single_source",
@@ -266,8 +277,11 @@ def main():
         "sampler": args.sampler,
         "sample_steps": args.sample_steps,
         "prompt_template": args.prompt_template,
+        "condition_type": condition_type,
         "single_source_only": args.single_source_only,
+        "single_direction_only": args.single_direction_only,
         "skipped_multi_source": skipped_multi_source,
+        "skipped_by_filter": skipped_multi_source,
         "order_accuracy_left_gt_center_gt_right": correct_order / max(len(selected_ids), 1),
         "left_vs_right_accuracy": left_right_correct / max(len(selected_ids), 1),
         "center_between_accuracy": center_between / max(len(selected_ids), 1),

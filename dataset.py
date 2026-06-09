@@ -17,6 +17,11 @@ SAMPLE_SECONDS = 1.0
 SAMPLE_LENGTH = int(SAMPLE_RATE * SAMPLE_SECONDS)
 PROMPT_FPS = 10.0
 DIRECTION_CATEGORIES = ("left", "center", "right", "mixed")
+DIRECTION_TO_ANGLE = {
+    "left": -60.0,
+    "center": 0.0,
+    "right": 60.0,
+}
 
 
 def discover_ids(data_root: Path) -> List[str]:
@@ -61,13 +66,27 @@ def prompt_for_center(prompts: Sequence[str], center_sec: float) -> str:
     return prompts[frame_index]
 
 
+def prompt_directions(prompt: str) -> List[str]:
+    return sorted(set(re.findall(r"\b(left|center|right)\b", prompt.lower())))
+
+
 def classify_prompt_direction(prompt: str) -> str:
-    directions = set(re.findall(r"\b(left|center|right)\b", prompt.lower()))
+    directions = prompt_directions(prompt)
     if len(directions) == 1:
-        return next(iter(directions))
+        return directions[0]
     if len(directions) > 1:
         return "mixed"
     return "none"
+
+
+def is_single_direction_prompt(prompt: str) -> bool:
+    return len(prompt_directions(prompt)) == 1
+
+
+def direction_to_angle_degrees(direction: str) -> float:
+    if direction not in DIRECTION_TO_ANGLE:
+        raise ValueError(f"Cannot map direction category {direction!r} to a single angle.")
+    return DIRECTION_TO_ANGLE[direction]
 
 
 class SimpleTokenizer:
@@ -149,8 +168,15 @@ class TASBenchDataset(Dataset):
         sample_rate: int = SAMPLE_RATE,
         sample_length: int = SAMPLE_LENGTH,
         balanced_direction_sampling: bool = False,
+        condition_type: str = "text",
+        angle_single_direction_only: bool = False,
         prompt_jitter_sec: float = 0.045,
+        candidate_seed: int = 2024,
     ):
+        if condition_type not in {"text", "angle"}:
+            raise ValueError(f"Unknown condition_type: {condition_type}")
+        if condition_type == "angle" and not angle_single_direction_only:
+            raise ValueError("condition_type='angle' requires angle_single_direction_only=True.")
         self.data_root = Path(data_root)
         self.audio_dir = self.data_root / "binaural_audios"
         self.prompt_dir = self.data_root / "text_prompts"
@@ -158,8 +184,14 @@ class TASBenchDataset(Dataset):
         self.split = split
         self.sample_rate = sample_rate
         self.sample_length = sample_length
+        self.condition_type = condition_type
+        self.angle_single_direction_only = angle_single_direction_only
         self.balanced_direction_sampling = balanced_direction_sampling and split == "train"
         self.prompt_jitter_sec = prompt_jitter_sec
+        self.candidate_seed = candidate_seed
+        self.active_direction_categories = (
+            ("left", "center", "right") if angle_single_direction_only else DIRECTION_CATEGORIES
+        )
 
         self.prompt_cache = {
             audio_id: load_prompts(self.prompt_dir / f"{audio_id}.csv")
@@ -168,8 +200,9 @@ class TASBenchDataset(Dataset):
         self.direction_candidates: Dict[str, List[Tuple[str, int]]] = {
             category: [] for category in DIRECTION_CATEGORIES
         }
+        self.all_direction_candidates: List[Tuple[str, int, str]] = []
         self.mixed_sampling_probability = 0.0
-        if self.balanced_direction_sampling:
+        if self.balanced_direction_sampling or self.angle_single_direction_only:
             self._build_direction_candidates()
 
     def _build_direction_candidates(self):
@@ -184,32 +217,51 @@ class TASBenchDataset(Dataset):
                 if center_sec + SAMPLE_SECONDS / 2 > duration_sec:
                     continue
                 category = classify_prompt_direction(prompt)
-                if category in self.direction_candidates:
+                if category in self.active_direction_categories:
                     self.direction_candidates[category].append((audio_id, frame_index))
 
-        empty = [category for category, candidates in self.direction_candidates.items() if not candidates]
+        empty = [
+            category
+            for category in self.active_direction_categories
+            if not self.direction_candidates[category]
+        ]
         if empty:
             raise RuntimeError(f"Direction-balanced sampling has empty candidate pools: {empty}")
-        total = sum(len(candidates) for candidates in self.direction_candidates.values())
-        self.mixed_sampling_probability = len(self.direction_candidates["mixed"]) / total
+        self.all_direction_candidates = [
+            (audio_id, frame_index, category)
+            for category in self.active_direction_categories
+            for audio_id, frame_index in self.direction_candidates[category]
+        ]
+        random.Random(self.candidate_seed).shuffle(self.all_direction_candidates)
+        total = sum(len(self.direction_candidates[category]) for category in self.active_direction_categories)
+        if "mixed" in self.active_direction_categories:
+            self.mixed_sampling_probability = len(self.direction_candidates["mixed"]) / total
+        else:
+            self.mixed_sampling_probability = 0.0
 
     def direction_sampling_summary(self) -> Dict[str, object]:
-        counts = {category: len(candidates) for category, candidates in self.direction_candidates.items()}
+        counts = {category: len(self.direction_candidates[category]) for category in self.active_direction_categories}
         return {
             "candidate_counts": counts,
             "mixed_sampling_probability": self.mixed_sampling_probability,
             "single_direction_probability": (1.0 - self.mixed_sampling_probability) / 3.0,
+            "angle_single_direction_only": self.angle_single_direction_only,
         }
 
     def _sample_balanced_candidate(self) -> Tuple[str, int, str]:
-        if random.random() < self.mixed_sampling_probability:
+        if "mixed" in self.active_direction_categories and random.random() < self.mixed_sampling_probability:
             category = "mixed"
         else:
             category = random.choice(("left", "center", "right"))
         audio_id, frame_index = random.choice(self.direction_candidates[category])
         return audio_id, frame_index, category
 
+    def _sample_single_direction_candidate(self) -> Tuple[str, int, str]:
+        return random.choice(self.all_direction_candidates)
+
     def __len__(self) -> int:
+        if self.angle_single_direction_only and self.split != "train":
+            return len(self.all_direction_candidates)
         return len(self.ids)
 
     def __getitem__(self, index: int) -> Dict[str, object]:
@@ -217,6 +269,10 @@ class TASBenchDataset(Dataset):
         selected_category = None
         if self.balanced_direction_sampling:
             audio_id, selected_frame_index, selected_category = self._sample_balanced_candidate()
+        elif self.angle_single_direction_only and self.split == "train":
+            audio_id, selected_frame_index, selected_category = self._sample_single_direction_candidate()
+        elif self.angle_single_direction_only:
+            audio_id, selected_frame_index, selected_category = self.all_direction_candidates[index]
         else:
             audio_id = self.ids[index]
         wav_path = self.audio_dir / f"{audio_id}.wav"
@@ -252,7 +308,7 @@ class TASBenchDataset(Dataset):
         center_sec = (start + self.sample_length / 2) / self.sample_rate
         prompt = prompt_for_center(self.prompt_cache[audio_id], center_sec)
         direction_category = selected_category or classify_prompt_direction(prompt)
-        return {
+        item = {
             "mono": mono,
             "diff": diff,
             "prompt": prompt,
@@ -260,6 +316,9 @@ class TASBenchDataset(Dataset):
             "audio_id": audio_id,
             "start_sec": float(start / self.sample_rate),
         }
+        if self.condition_type == "angle":
+            item["angle_degrees"] = direction_to_angle_degrees(direction_category)
+        return item
 
 
 class TASCollator:
@@ -268,15 +327,24 @@ class TASCollator:
 
     def __call__(self, batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         prompts = [item["prompt"] for item in batch]
-        return {
+        result = {
             "mono": torch.stack([item["mono"] for item in batch]),
             "diff": torch.stack([item["diff"] for item in batch]),
-            "tokens": self.tokenizer.batch_encode(prompts),
             "prompts": prompts,
             "direction_categories": [item["direction_category"] for item in batch],
             "audio_ids": [item["audio_id"] for item in batch],
             "start_sec": torch.tensor([item["start_sec"] for item in batch], dtype=torch.float32),
         }
+        if self.tokenizer is None:
+            result["tokens"] = {
+                "angle_degrees": torch.tensor(
+                    [float(item["angle_degrees"]) for item in batch],
+                    dtype=torch.float32,
+                ).unsqueeze(1)
+            }
+        else:
+            result["tokens"] = self.tokenizer.batch_encode(prompts)
+        return result
 
 
 def collect_split_prompts(data_root: Path, ids: Sequence[str]) -> List[str]:

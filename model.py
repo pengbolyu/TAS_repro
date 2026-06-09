@@ -47,6 +47,30 @@ class CLIPTextEncoder(nn.Module):
         return self.norm(text_features)
 
 
+class AngleConditionEncoder(nn.Module):
+    def __init__(self, embed_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
+
+    def forward(self, condition) -> torch.Tensor:
+        angle_degrees = condition["angle_degrees"].float()
+        angle_radians = angle_degrees * math.pi / 180.0
+        features = torch.cat(
+            [
+                torch.sin(angle_radians),
+                torch.cos(angle_radians),
+                angle_degrees / 90.0,
+            ],
+            dim=-1,
+        )
+        return self.net(features)
+
+
 class AudioEncoder(nn.Module):
     def __init__(self, feature_dim: int = 512):
         super().__init__()
@@ -120,13 +144,20 @@ class TASDiffusionNet(nn.Module):
         time_dim: int = 128,
         residual_blocks: int = 3,
         dilated_layers: int = 10,
+        condition_type: str = "text",
     ):
         super().__init__()
-        self.text_encoder = CLIPTextEncoder(
-            model_name=text_model_name,
-            embed_dim=feature_dim,
-            local_files_only=local_files_only,
-        )
+        if condition_type not in {"text", "angle"}:
+            raise ValueError(f"Unknown condition_type: {condition_type}")
+        self.condition_type = condition_type
+        if condition_type == "text":
+            self.text_encoder = CLIPTextEncoder(
+                model_name=text_model_name,
+                embed_dim=feature_dim,
+                local_files_only=local_files_only,
+            )
+        else:
+            self.angle_encoder = AngleConditionEncoder(embed_dim=feature_dim)
         self.audio_encoder = AudioEncoder(feature_dim=feature_dim)
         self.saf = SemanticAwareFusion(feature_dim=feature_dim)
         self.input_proj = nn.Conv1d(2, hidden_channels, kernel_size=3, padding=1)
@@ -154,9 +185,12 @@ class TASDiffusionNet(nn.Module):
         self.time_dim = time_dim
 
     def forward(self, noisy_diff: torch.Tensor, mono: torch.Tensor, tokens: torch.Tensor, timesteps: torch.Tensor):
-        text_features = self.text_encoder(tokens)
+        if self.condition_type == "text":
+            condition_features = self.text_encoder(tokens)
+        else:
+            condition_features = self.angle_encoder(tokens)
         audio_features = self.audio_encoder(mono)
-        cond = self.saf(audio_features, text_features)
+        cond = self.saf(audio_features, condition_features)
         time_emb = self.time_mlp(timestep_embedding(timesteps, self.time_dim))
 
         h = self.input_proj(torch.cat([noisy_diff, mono], dim=1))

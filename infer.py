@@ -6,7 +6,13 @@ import torch
 import torch.nn.functional as F
 import torchaudio.functional as AF
 
-from dataset import CLIPPromptTokenizer, SAMPLE_LENGTH, SAMPLE_RATE
+from dataset import (
+    CLIPPromptTokenizer,
+    SAMPLE_LENGTH,
+    SAMPLE_RATE,
+    classify_prompt_direction,
+    direction_to_angle_degrees,
+)
 from model import GaussianDiffusion, TASDiffusionNet, binaural_from_mono_diff
 
 
@@ -15,6 +21,7 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--input_wav", required=True)
     parser.add_argument("--prompt", required=True)
+    parser.add_argument("--angle_degrees", type=float, default=None)
     parser.add_argument("--out", required=True)
     parser.add_argument("--mode", choices=["clip", "full"], default="clip")
     parser.add_argument("--start_sec", type=float, default=0.0)
@@ -73,16 +80,20 @@ def build_window_starts(total_samples: int, sample_length: int, hop_length: int)
 def load_model_and_tokenizer(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     ckpt_args = checkpoint.get("args", {})
+    condition_type = ckpt_args.get("condition_type", "text")
     text_model_name = checkpoint.get("text_model_name") or ckpt_args.get(
         "text_model_name", "openai/clip-vit-base-patch32"
     )
     local_files_only = not args.allow_model_download
-    tokenizer = CLIPPromptTokenizer(model_name=text_model_name, local_files_only=local_files_only)
+    tokenizer = None
+    if condition_type == "text":
+        tokenizer = CLIPPromptTokenizer(model_name=text_model_name, local_files_only=local_files_only)
     model = TASDiffusionNet(
         text_model_name=text_model_name,
         local_files_only=local_files_only,
         feature_dim=int(ckpt_args.get("feature_dim", 512)),
         hidden_channels=int(ckpt_args.get("hidden_channels", 64)),
+        condition_type=condition_type,
     )
     model.load_state_dict(checkpoint["model"])
     diffusion = GaussianDiffusion(
@@ -91,7 +102,17 @@ def load_model_and_tokenizer(args):
         diff_loss_weight=float(ckpt_args.get("diff_loss_weight", 0.1)),
         ild_loss_weight=float(ckpt_args.get("ild_loss_weight", 0.1)),
     )
-    return diffusion, tokenizer
+    return diffusion, tokenizer, condition_type
+
+
+def build_conditioning(prompt: str, angle_degrees, tokenizer, condition_type: str, device: torch.device):
+    if condition_type == "text":
+        tokens = tokenizer.batch_encode([prompt])
+        return {key: value.to(device) for key, value in tokens.items()}
+    if angle_degrees is None:
+        direction = classify_prompt_direction(prompt)
+        angle_degrees = direction_to_angle_degrees(direction)
+    return {"angle_degrees": torch.tensor([[float(angle_degrees)]], dtype=torch.float32, device=device)}
 
 
 @torch.no_grad()
@@ -164,13 +185,12 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    diffusion, tokenizer = load_model_and_tokenizer(args)
+    diffusion, tokenizer, condition_type = load_model_and_tokenizer(args)
     diffusion = diffusion.to(device)
     diffusion.eval()
 
     mono = load_mono(Path(args.input_wav))
-    tokens = tokenizer.batch_encode([args.prompt])
-    tokens = {key: value.to(device) for key, value in tokens.items()}
+    tokens = build_conditioning(args.prompt, args.angle_degrees, tokenizer, condition_type, device)
 
     if args.mode == "clip":
         mono_clip = crop_mono_clip(mono, args.start_sec).to(device)

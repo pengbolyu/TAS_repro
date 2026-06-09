@@ -47,6 +47,38 @@ Training also writes:
 
 Both outputs include the four loss components and cumulative sampled direction ratios.
 
+## Angle-condition diagnostic training
+
+To test whether the audio model can learn audible direction control without CLIP text
+understanding, train with angle conditioning:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\train.py --data_root data\TASBench --run_dir code\TAS_repro\runs\angle_single_direction --condition_type angle --angle_single_direction_only --batch_size 12 --max_steps 3000 --lr 2e-4 --val_interval 200 --val_batches 20
+```
+
+This keeps prompts with exactly one direction (`left`, `center`, or `right`), including
+multi-object same-direction prompts such as `female vocals and piano are on the right`.
+It drops prompts containing multiple directions, because a single angle cannot represent
+different objects at different positions.
+
+Angle mapping:
+
+- `left -> -60 degrees`
+- `center -> 0 degrees`
+- `right -> 60 degrees`
+
+Run angle-conditioned inference either with a prompt direction:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\infer.py --checkpoint code\TAS_repro\runs\angle_single_direction\best.pt --input_wav data\TASBench\binaural_audios\000001.wav --prompt "The piano is on the left." --out code\TAS_repro\runs\angle_single_direction\sample_left.wav --sample_steps 50
+```
+
+or with an explicit angle:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\infer.py --checkpoint code\TAS_repro\runs\angle_single_direction\best.pt --input_wav data\TASBench\binaural_audios\000001.wav --prompt "angle condition" --angle_degrees -60 --out code\TAS_repro\runs\angle_single_direction\sample_left.wav --sample_steps 50
+```
+
 To view curves:
 
 ```powershell
@@ -103,3 +135,10 @@ For a cleaner ILD sanity check, restrict evaluation to prompts containing one ob
 ```
 
 For listening-ready full-audio evaluation, add `--mode full --hop_sec 0.25 --save_audio`, but it will be much slower and writes three wav files per item.
+
+For angle checkpoints, use `--single_direction_only` to preserve multi-object same-direction
+items while filtering multi-direction prompts:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\batch_eval_prompts.py --checkpoint code\TAS_repro\runs\angle_single_direction\best.pt --data_root data\TASBench --split val --num_items 50 --mode clip --sample_steps 20 --sampler ddim --single_direction_only --out_dir code\TAS_repro\runs\angle_single_direction\prompt_eval_val50
+```
