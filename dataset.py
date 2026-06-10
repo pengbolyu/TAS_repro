@@ -17,10 +17,10 @@ SAMPLE_SECONDS = 1.0
 SAMPLE_LENGTH = int(SAMPLE_RATE * SAMPLE_SECONDS)
 PROMPT_FPS = 10.0
 DIRECTION_CATEGORIES = ("left", "center", "right", "mixed")
-DIRECTION_TO_ANGLE = {
-    "left": -60.0,
-    "center": 0.0,
-    "right": 60.0,
+DIRECTION_TO_ID = {
+    "left": 0,
+    "center": 1,
+    "right": 2,
 }
 
 
@@ -83,10 +83,18 @@ def is_single_direction_prompt(prompt: str) -> bool:
     return len(prompt_directions(prompt)) == 1
 
 
-def direction_to_angle_degrees(direction: str) -> float:
-    if direction not in DIRECTION_TO_ANGLE:
-        raise ValueError(f"Cannot map direction category {direction!r} to a single angle.")
-    return DIRECTION_TO_ANGLE[direction]
+def direction_to_id(direction: str) -> int:
+    if direction not in DIRECTION_TO_ID:
+        raise ValueError(f"Cannot map direction category {direction!r} to a single direction id.")
+    return DIRECTION_TO_ID[direction]
+
+
+def angle_degrees_to_direction(angle_degrees: float) -> str:
+    if angle_degrees < -30.0:
+        return "left"
+    if angle_degrees > 30.0:
+        return "right"
+    return "center"
 
 
 class SimpleTokenizer:
@@ -317,7 +325,7 @@ class TASBenchDataset(Dataset):
             "start_sec": float(start / self.sample_rate),
         }
         if self.condition_type == "angle":
-            item["angle_degrees"] = direction_to_angle_degrees(direction_category)
+            item["direction_id"] = direction_to_id(direction_category)
         return item
 
 
@@ -337,10 +345,10 @@ class TASCollator:
         }
         if self.tokenizer is None:
             result["tokens"] = {
-                "angle_degrees": torch.tensor(
-                    [float(item["angle_degrees"]) for item in batch],
-                    dtype=torch.float32,
-                ).unsqueeze(1)
+                "direction_ids": torch.tensor(
+                    [int(item["direction_id"]) for item in batch],
+                    dtype=torch.long,
+                )
             }
         else:
             result["tokens"] = self.tokenizer.batch_encode(prompts)

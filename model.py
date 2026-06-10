@@ -50,25 +50,12 @@ class CLIPTextEncoder(nn.Module):
 class AngleConditionEncoder(nn.Module):
     def __init__(self, embed_dim: int = 512):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(3, embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )
+        self.embedding = nn.Embedding(3, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, condition) -> torch.Tensor:
-        angle_degrees = condition["angle_degrees"].float()
-        angle_radians = angle_degrees * math.pi / 180.0
-        features = torch.cat(
-            [
-                torch.sin(angle_radians),
-                torch.cos(angle_radians),
-                angle_degrees / 90.0,
-            ],
-            dim=-1,
-        )
-        return self.net(features)
+        direction_ids = condition["direction_ids"].long()
+        return self.norm(self.embedding(direction_ids))
 
 
 class AudioEncoder(nn.Module):

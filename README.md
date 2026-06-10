@@ -61,11 +61,14 @@ multi-object same-direction prompts such as `female vocals and piano are on the 
 It drops prompts containing multiple directions, because a single angle cannot represent
 different objects at different positions.
 
-Angle mapping:
+Internally, angle mode uses a learned direction embedding:
 
-- `left -> -60 degrees`
-- `center -> 0 degrees`
-- `right -> 60 degrees`
+- `left -> id 0`
+- `center -> id 1`
+- `right -> id 2`
+
+`--angle_degrees` is still accepted for convenience and is mapped to the nearest direction:
+values below `-30` become left, values above `30` become right, and the rest become center.
 
 Run angle-conditioned inference either with a prompt direction:
 

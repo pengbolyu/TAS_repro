@@ -10,8 +10,9 @@ from dataset import (
     CLIPPromptTokenizer,
     SAMPLE_LENGTH,
     SAMPLE_RATE,
+    angle_degrees_to_direction,
     classify_prompt_direction,
-    direction_to_angle_degrees,
+    direction_to_id,
 )
 from model import GaussianDiffusion, TASDiffusionNet, binaural_from_mono_diff
 
@@ -109,10 +110,8 @@ def build_conditioning(prompt: str, angle_degrees, tokenizer, condition_type: st
     if condition_type == "text":
         tokens = tokenizer.batch_encode([prompt])
         return {key: value.to(device) for key, value in tokens.items()}
-    if angle_degrees is None:
-        direction = classify_prompt_direction(prompt)
-        angle_degrees = direction_to_angle_degrees(direction)
-    return {"angle_degrees": torch.tensor([[float(angle_degrees)]], dtype=torch.float32, device=device)}
+    direction = angle_degrees_to_direction(float(angle_degrees)) if angle_degrees is not None else classify_prompt_direction(prompt)
+    return {"direction_ids": torch.tensor([direction_to_id(direction)], dtype=torch.long, device=device)}
 
 
 @torch.no_grad()
