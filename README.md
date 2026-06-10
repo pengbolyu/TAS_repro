@@ -82,6 +82,12 @@ or with an explicit angle:
 & "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\infer.py --checkpoint code\TAS_repro\runs\angle_single_direction\best.pt --input_wav data\TASBench\binaural_audios\000001.wav --prompt "angle condition" --angle_degrees -60 --out code\TAS_repro\runs\angle_single_direction\sample_left.wav --sample_steps 50
 ```
 
+Add `--diff_out` to save the generated differential signal as a mono wav for debugging:
+
+```powershell
+& "F:\Anaconda\envs\HRTF\python.exe" code\TAS_repro\infer.py --checkpoint code\TAS_repro\runs\angle_single_direction\best.pt --input_wav data\TASBench\binaural_audios\000001.wav --prompt "angle condition" --angle_degrees -60 --out code\TAS_repro\runs\angle_single_direction\sample_left.wav --diff_out code\TAS_repro\runs\angle_single_direction\sample_left_diff.wav --sample_steps 50
+```
+
 To view curves:
 
 ```powershell

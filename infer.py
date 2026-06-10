@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--angle_degrees", type=float, default=None)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--diff_out", default=None, help="Optional path to save generated diff as a mono wav.")
     parser.add_argument("--mode", choices=["clip", "full"], default="clip")
     parser.add_argument("--start_sec", type=float, default=0.0)
     parser.add_argument("--hop_sec", type=float, default=0.25)
@@ -130,7 +131,7 @@ def infer_clip(
         clip_denoised=clip_denoised,
         sampler=sampler,
     )
-    return binaural_from_mono_diff(mono_clip, pred_diff)
+    return binaural_from_mono_diff(mono_clip, pred_diff), pred_diff
 
 
 @torch.no_grad()
@@ -172,7 +173,22 @@ def infer_full(
     full_diff = diff_sum / weight_sum.clamp_min(1e-6)
     full_diff = full_diff[:, :original_total]
     full_mono = mono[:, :original_total]
-    return binaural_from_mono_diff(full_mono.unsqueeze(0), full_diff.unsqueeze(0))
+    full_diff = full_diff.unsqueeze(0)
+    return binaural_from_mono_diff(full_mono.unsqueeze(0), full_diff), full_diff
+
+
+def write_audio(path: Path, audio: torch.Tensor, sample_rate: int = SAMPLE_RATE):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wav = audio.squeeze(0).detach().cpu()
+    if wav.ndim == 2:
+        wav = wav.transpose(0, 1)
+    wav = wav.numpy()
+    peak = abs(wav).max()
+    if peak > 1.0:
+        print(f"warning: output peak {peak:.4f} exceeds 1.0 for {path}; clipping before wav write")
+        wav = wav.clip(-1.0, 1.0)
+    sf.write(str(path), wav, sample_rate)
+    return peak, wav.shape[0]
 
 
 def main():
@@ -193,7 +209,7 @@ def main():
 
     if args.mode == "clip":
         mono_clip = crop_mono_clip(mono, args.start_sec).to(device)
-        binaural = infer_clip(
+        binaural, pred_diff = infer_clip(
             diffusion,
             mono_clip,
             tokens,
@@ -207,7 +223,7 @@ def main():
             f"window={SAMPLE_LENGTH / SAMPLE_RATE:.2f}s hop={args.hop_sec:.2f}s "
             f"sample_steps={args.sample_steps} sampler={args.sampler}"
         )
-        binaural = infer_full(
+        binaural, pred_diff = infer_full(
             diffusion,
             mono,
             tokens,
@@ -219,14 +235,12 @@ def main():
         )
 
     out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    wav = binaural.squeeze(0).detach().cpu().transpose(0, 1).numpy()
-    peak = abs(wav).max()
-    if peak > 1.0:
-        print(f"warning: output peak {peak:.4f} exceeds 1.0; clipping before wav write")
-        wav = wav.clip(-1.0, 1.0)
-    sf.write(str(out_path), wav, SAMPLE_RATE)
-    print(f"saved: {out_path} sr={SAMPLE_RATE} channels=2 samples={wav.shape[0]}")
+    _, samples = write_audio(out_path, binaural)
+    print(f"saved: {out_path} sr={SAMPLE_RATE} channels=2 samples={samples}")
+    if args.diff_out:
+        diff_path = Path(args.diff_out)
+        _, diff_samples = write_audio(diff_path, pred_diff)
+        print(f"saved diff: {diff_path} sr={SAMPLE_RATE} channels=1 samples={diff_samples}")
 
 
 if __name__ == "__main__":

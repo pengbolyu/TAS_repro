@@ -180,7 +180,7 @@ def main():
             tokens = build_conditioning(prompt, None, tokenizer, condition_type, device)
             if args.mode == "clip":
                 mono_clip = crop_mono_clip(mono, args.start_sec).to(device)
-                binaural = infer_clip(
+                binaural, _ = infer_clip(
                     diffusion,
                     mono_clip,
                     tokens,
@@ -189,7 +189,7 @@ def main():
                     args.sampler,
                 )
             else:
-                binaural = infer_full(
+                binaural, _ = infer_full(
                     diffusion,
                     mono,
                     tokens,
